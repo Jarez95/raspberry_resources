@@ -1,0 +1,998 @@
+#!/usr/bin/env python
+
+# Raspberry PI for Node 2
+# Master
+
+from gps import *
+from time import * # double check this
+import os
+import RPi.GPIO as GPIO
+import time
+import sys
+import spidev
+from Tkinter import *
+import serial
+import socket
+import threading
+import thread
+import datetime
+
+# ************************** Setup **************************************
+# elevate python
+pythonPID = os.getpid()
+elevatePriority = "sudo renice -n -19 -p " + str(pythonPID)
+os.system(elevatePriority)
+#elevate idle
+os.system('sudo renice -18 `pgrep idle`')
+
+# Setup the GUI
+os.system('clear') # not sure if all this is neccessary yet
+os.system('sudo killall gpsd')
+os.system('sudo gpsd /dev/ttyUSB0 -F /var/run/gpsd.sock')
+os.system('sudo service ntp restart')
+gpsd = None # Global variable
+# end of commands to reset the service
+mGui = Tk()
+mGui.geometry("800x500+220+140") # Window Geometry
+mGui.title("GPSDO Control Interface")
+# End of GUI setup
+High = GPIO.HIGH
+Low = GPIO.LOW
+PLL_LOCK = 11 # Probes the PLL Lock pin
+ResetLine = 13 # Reset the PLL line
+PPS_OUT = 15 # PPS_OUT from the GPSDO
+Trigger_Pass = 29 # Trigger Pass Pulse Output Pin
+InterruptTest = 37
+PPS_OUT2 = 31
+PPS_OUT3 = 33
+GPIO.setwarnings(False)
+GPIO.cleanup()
+GPIO.setmode(GPIO.BOARD)
+spi = spidev.SpiDev()
+spi.open(0,0) # Open an SPI port bus = 0 , device = 0
+spi.max_speed_hz = 200000 #200Khz
+GPSDO_Present = True
+if (GPSDO_Present == True):
+    GPSDO = serial.Serial(
+        port = '/dev/ttyUSB0',
+        baudrate = 9600,
+        parity = serial.PARITY_NONE,
+        stopbits = serial.STOPBITS_ONE,
+        bytesize = serial.EIGHTBITS,
+        timeout = 1)
+#Setup the network parameters
+LocalAddr = "192.168.1.30"
+RaspN3Addr = "192.168.1.31"
+Port = 25001
+Buffer_Size = 20 # watch this
+#End of network parameters
+
+# Setup and define IO
+GPIO.setup(InterruptTest, GPIO.OUT)
+GPIO.setup(ResetLine, GPIO.OUT)
+GPIO.output(ResetLine,High)
+GPIO.setup(Trigger_Pass, GPIO.OUT)
+GPIO.output(Trigger_Pass,Low) # Initial state of Trigger
+GPIO.setup(PPS_OUT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(PPS_OUT2, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(PPS_OUT3, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(PLL_LOCK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+Track_state = IntVar()
+Sync_state = IntVar()
+GPS_state = IntVar()
+#************************ Setup Complete ********************************
+
+# ************************ Variables ************************************
+PLLtextString = StringVar()
+TriggerTextLabel = StringVar()
+exitFlag = -1
+Nil = 0b00000000
+user_query = StringVar()
+GSPDO_Response = StringVar()
+trig_time = StringVar()
+current_time = StringVar()
+PPS_COUNTER = 1;
+AllowTrigger = False
+PPS_INTERRUPT = False
+TRIGGER_DEADLINE = -1 # No trigger deadline has been set
+WINDOW_LENGTH = 1# In seconds
+MesgDispOpen = False
+MesgDispClose = False
+WINDOW_OPEN = False
+WINDOWS_CLOSE = False
+PulsePreDelay = 0
+Message = "Nil"
+RecvMessage = "Nil"
+SentMessage = False
+Slave_Connected = False
+conn = socket.socket
+s = socket.socket
+Disconnect = False
+DisableTimeMonitor = False
+GPS_Readings = False
+# GPS Variables
+Latitude = StringVar()
+Longitude = StringVar()
+TimeUTC = StringVar()
+Altitude = StringVar()
+EPS = StringVar()
+EPX = StringVar()
+EPV = StringVar()
+EPT = StringVar()
+Speed = StringVar()
+Climb = StringVar()
+Track = StringVar()
+Mode = StringVar()
+Sat = StringVar()
+SystemTimeSet = False
+# End of GPS Variables
+#Master Variables
+FreqAdj = StringVar()
+PeakVoltRB = StringVar()
+DC_Photo = StringVar()
+Varac = StringVar()
+RBLamp = StringVar()
+RBHeating = StringVar()
+#Tracking Variables
+Alarm = StringVar()
+Tracking = StringVar()
+Tau = StringVar()
+CompOff = StringVar()
+RawAdj = StringVar()
+FreqCorr = StringVar()
+SyncPeriod = StringVar()
+DisableTimeMonitor = False
+Calibrated = False
+# *********************End of Variables *********************************
+
+#*************Exit Routine****************
+def exit_routine(): # runs this routine upon exit
+    global Trigger_Pass, Low, High, exitFlag, Disconnect
+    exitFlag = 1
+    Disconnect = True
+    DO_TextBox.insert(END,"****Exiting Program****\n")
+    GPIO.output(Trigger_Pass,Low)
+    spi.close() # Close the link with SPI Dev
+    mGui.destroy() # close the window
+    os._exit(1)
+mGui.protocol('WM_DELETE_WINDOW',exit_routine)
+
+def stopThread(self):
+  print "Shutting down thread: " + str(self)
+  if self.process is not None:
+    self.process.terminate()
+    self.process = None
+
+def return_hit(event):
+  if (user_query.get() != ""):
+    GPSDO_Send()
+    user_query.set("") # clear the query box when enter is pressed
+  if (trig_time.get() != ""):
+    TriggerHandle()
+    trig_time.set("") # clear the trigger query box
+  if ((SyncPeriod.get()) != ""):
+      SyncPeriod.set(SyncPeriod.get())
+mGui.bind('<Return>',return_hit)
+
+def RestartSocketGPS():
+    global gpsd
+    os.system('clear') # not sure if all this is neccessary yet
+    os.system('sudo killall gpsd')
+    os.system('sudo gpsd /dev/ttyUSB0 -F /var/run/gpsd.sock')
+    os.system('sudo service ntp restart')
+    gpsd = None # Global variable
+
+#***************END***********************
+
+# GPS polling definition
+class GpsPoller(threading.Thread):
+  def __init__(self):
+    threading.Thread.__init__(self)
+    global gpsd #bring it in scope
+    try:
+        print "Enabling the watch"
+        gpsd = gps(mode=WATCH_ENABLE) #starting the stream of info
+    except Exception,e:
+        print "GPSD: " + str(e)
+        RestartSocketGPS()
+        gpsd = gps(mode=WATCH_ENABLE) #starting the stream of info
+        print "Done resetting sockets"
+    self.current_value = None
+    self.running = True #setting the thread running to true
+
+  def run(self):
+    global gpsd
+    while gpsp.running:
+      gpsd.next() #this will continue to loop and grab EACH set of gpsd info to clear the buffer
+
+# myTHREAD DEFINITION
+class myThread (threading.Thread):
+    def __init__(self, threadID, name):
+        threading.Thread.__init__(self)
+        self.threadID = threadID
+        self.name = name
+    def run(self):
+        print "Starting " + self.name + "\n"
+        if (self.name == "PLL LOCK THREAD"):
+            CHECK_PLL_LOCK(self.name)
+        elif (self.name == "TRIGGER THREAD"):
+            SEND_TRIGGER(self.name)
+        elif (self.name == "PPS DETECT THREAD"):
+            PPS_OUT_DETECT(self.name)
+        elif (self.name == "TRIGGER MONITOR THREAD"):
+            TRIGGER_MONITOR(self.name)
+        elif (self.name == "LISTEN FOR SLAVE THREAD"):
+            LISTEN_FOR_SLAVE(self.name)
+        elif (self.name == "SEND DATA SLAVE THREAD"):
+            SEND_DATA_SLAVE(self.name)
+        elif (self.name == "RECEIVE DATA SLAVE THREAD"):
+            RECEIVE_DATA_SLAVE(self.name)
+        elif (self.name == "DISCONNECT THREAD"):
+            DISCONNECT(self.name)
+        elif (self.name == "TIME MONITOR THREAD"):
+            TIME_MONITOR(self.name)
+        elif (self.name == "GPS POLLER THREAD"):
+            GPS_POLLER(self.name)
+        elif (self.name == "PPS TICKER THREAD"):
+            PPS_TICKER(self.name)
+        elif (self.name == "SYNC PERIOD THREAD"):
+            SYNC_PERIOD(self.name)
+        print "Exiting " + self.name + "\n"
+
+def TIME_MONITOR(threadName):
+  global current_time, DisableTimeMonitor
+  SysTimeSet = False
+  while (exitFlag == -1):
+    try:
+      if (SysTimeSet == False):
+        GPSDO_Time = str(Collect_Response('TD'))[0:8]
+        GPSDO_Date = str(Collect_Response('DT'))[0:10]
+        TimeLength = len(GPSDO_Time) - 2
+        gpstime = GPSDO_Date[0:4] + GPSDO_Date[5:7] + GPSDO_Date[8:10] + " " + GPSDO_Time
+        os.system('sudo date -u --set="%s"'% gpstime)
+        print "System Time set to GPS time"
+        SysTimeSet = True
+      current_time.set("Time: "+str(datetime.datetime.now().time())[0:8] ) # refresh the display
+    except Exception,e:
+      print str(e)
+    time.sleep(1)
+
+def GPS_POLLER(threadName):
+  global SystemTimeSet, gpsp, GPS_Readings
+  global Latitude,Longitude,TimeUTC,Altitude,EPS,EPX,EPV,EPT,Speed,Climb,Track,Mode,Sat # bring the string vars into the scope
+  GPS_Init = False
+  try:
+    while (exitFlag == -1):
+      while (GPS_Readings == True):
+        if (GPS_Init == False): # initialise GPS communications once
+          gpsp = GpsPoller() # create the thread
+          gpsp.start() # start it up
+          print "Started up the GPS Polling thread"
+          GPS_Init = True
+        try:
+          os.system('clear')
+          Latitude.set("Latitude: " + str(gpsd.fix.latitude))
+          Longitude.set("Longitude: " + str(gpsd.fix.longitude))
+          TimeUTC.set("Time UTC: " + str(str(gpsd.utc) + " + " + str(gpsd.fix.time)))
+          Altitude.set("Altitude /m: " + str(gpsd.fix.altitude))
+          EPS.set("EPS: " + str(gpsd.fix.eps))
+          EPX.set("EPX: " + str(gpsd.fix.epx))
+          EPV.set("EPV: " + str(gpsd.fix.epv))
+          EPT.set("EPT: " + str(gpsd.fix.ept))
+          Speed.set("Speed (m/s): " + str(gpsd.fix.speed))
+          Climb.set("Climb: " + str(gpsd.fix.climb))
+          Track.set("Track: " + str(gpsd.fix.track))
+          Mode.set("Mode: " + str(gpsd.fix.mode))
+          Sat.set("Satellites: " + str(gpsd.satellites))
+
+          #Set the system time to the time received from the GPS
+          if (gpsd.utc != None) & (gpsd.utc != "") & (gpsd.utc != " ") & (SystemTimeSet == False):
+            print "Setting system time to GPS Time"
+            gpstime = gpsd.utc[0:4] + gpsd.utc[5:7] + gpsd.utc[8:10] + ' ' + gpsd.utc[11:13] + gpsd.utc[13:19]
+            #print str(gpstime)
+            os.system('sudo date -u --set="%s"'% gpstime)
+            print "Set system time successfully"
+            SystemTimeSet = True
+          time.sleep(2) #set to whatever
+        except Exception,e:
+          print str(e)
+      time.sleep(0.001) # ensure this does not interrupt
+  except Exception,e:
+    print str(e)
+
+def SYNC_PERIOD(threadName):
+    global SyncPeriod, DisableTimeMonitor
+    time.sleep(5)
+    SyncCounter = 1
+    while (exitFlag == -1):
+        try:
+            DisableTimeMonitor = True
+            DO_TextBox.insert(END, "SYNC: " + str(SyncCounter) + "\n")
+            DO_TextBox.yview(END)
+            SyncCounter = SyncCounter + 1
+            Collect_Response('SY1')
+            time.sleep(2)
+            Collect_Response('SY0')
+            time.sleep(float(SyncPeriod.get()))
+            DisableTimeMonitor = False
+        except Exception,e:
+            print str(e)
+        time.sleep(0.1)
+
+# **************** Networking threads *********************
+
+def LISTEN_FOR_SLAVE(threadName):
+    global LocalAddr, Buffer_Size, s, conn, addr, Slave_Connected, Disconnect
+    count = 0
+    while (exitFlag == -1):
+        if (Slave_Connected == False) & (Disconnect == False):
+            try:
+              count = count + 1
+              NetworkTextBox.delete('1.0',END)
+              NetworkTextBox.insert(END, "Listening for Slaves ... \n")
+              NetworkTextBox.yview(END)
+              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              s.bind((LocalAddr,Port))
+              s.listen(1)
+              conn, addr = s.accept()
+              NetworkTextBox.insert(END, "Connected to Slave \n")
+              NetworkTextBox.yview(END)
+              Slave_Connected = True
+            except Exception,e:
+                if (count == 50):
+                    print str(e)
+                    count = 0
+        time.sleep(0.1) # listen for slaves at 10Hz
+
+def SEND_DATA_SLAVE(threadName):
+    global conn, Message, SentMessage
+    while (exitFlag == -1):
+        if (Message != "Nil") & (Message != "") & (Message != " ") & (Slave_Connected == True):
+            try:
+              print "Sending Message"
+              conn.send(Message) # send the message
+              Message = "Nil" # reset the message
+              SentMessage = True # set the flag for receive data to work
+            except Exception,e:
+              print str(e)
+        time.sleep(0.01) # be prepared to send data at 100Hz
+
+def RECEIVE_DATA_SLAVE(threadName):
+    global Buffer_Size, RecvMessage, SentMessage, conn, Slave_Connected
+    while (exitFlag == -1):
+        if (Slave_Connected == True) & (SentMessage == True):
+            try:
+                RecvMessage = conn.recv(Buffer_Size)
+                if not RecvMessage: break
+                print "Received data: " , RecvMessage
+                SentMessage = False
+            except Exception,e:
+                print str(e)
+        time.sleep(0.01) # be prepared to receive data at 100Hz
+
+def DISCONNECT(threadName):
+  global Disconnect, s
+  while (exitFlag == -1):
+    if (Disconnect == True):
+      try:
+          s.close()
+          #conn.close()
+          NetworkTextBox.insert(END, "Disconnected from Slave \n")
+          NetworkTextBox.yview(END)
+          print "Shutdown Connections"
+      except Exception,e:
+          print str(e)
+    time.sleep(0.0001) # be prepared to disconnect at 10Khz
+
+# *************** End of networking threads ******************
+
+# ************** PPS Monitoring threads **********************
+
+def PPS_Interrupt_Call(channel):
+  global PPS_INTERRUPT
+  PPS_INTERRUPT = True # set the PPS interrupt flag to True
+  #GPIO.output(37,High)
+
+def PPS_TICKER(threadName):
+    global PPS_COUNTER, PPS_INTERRUPT
+    global MesgDispOpen, MesgDispClose, WINDOW_OPEN, WINDOWS_CLOSE
+    PPS_COUNT_PREVIOUS = 0
+    while (exitFlag == -1):
+        try:
+          if(PPS_INTERRUPT == True) & (PPS_COUNTER >= 1) & (PPS_COUNT_PREVIOUS != PPS_COUNTER):
+            TextBox.insert(END, "PPS out Detected: " + str(PPS_COUNTER) +"\n")
+            TextBox.yview(END)
+            PPS_COUNT_PREVIOUS = PPS_COUNTER
+          if(WINDOW_OPEN == True) & (MesgDispOpen == False):
+            TextBox.insert(END, "Trigger Window Open \n")
+            TextBox.yview(END)
+            MesgDispOpen = True
+          if (WINDOWS_CLOSE == True) & (MesgDispClose == False):
+            TextBox.insert(END, "Trigger Window Closed \n")
+            TextBox.yview(END)
+            MesgDispClose = True
+        except Exception,e:
+          print str(e)
+          os._exit(1)
+        time.sleep(0.001) #run at 1kHz
+
+def PPS_OUT_DETECT(threadName): # Thread continusously runs only executes when the PPS Flag is set
+  global PPS_COUNTER, PPS_INTERRUPT
+  while (exitFlag == -1):
+    try:
+      if(PPS_INTERRUPT == True) & (PPS_COUNTER >= 1):
+        PPS_COUNTER = PPS_COUNTER + 1
+        time.sleep(0.1) # interrupt cant happen for another 50ms
+        PPS_INTERRUPT = False
+    except Exception,e:
+      #print str(e)
+      os._exit(1)
+    time.sleep(0.0001) #running at 10KHz
+
+def CHECK_PLL_LOCK(threadName):
+  while (exitFlag == -1):
+    try:
+      PLL_Lock_Status()
+    except Exception,e:
+      os._exit(1) # may cause issues have a look at this
+    time.sleep(10) # Check PLL Lock Status every 10 seconds
+
+def PLL_Lock_Status():
+  if (GPIO.input(PLL_LOCK) == True) & (exitFlag == -1):
+    PLLtextString.set("PLL LOCKED")
+    return 1
+  elif (GPIO.input(PLL_LOCK) == False) & (exitFlag == -1):
+    PLLtextString.set("***PLL UNLOCKED***")
+    return 0
+
+# ************** End of PPS Monitoring threads ********************
+
+def CalculatePulseDelay():
+    global PulsePreDelay
+    if (PulsePreDelay == 0):
+        PulseLength = Collect_Response('PW?????????')
+        #print "Pulse Length" , PulseLength
+        PulseLength = float(PulseLength) * (0.000000066)
+        #print str(PulseLength)
+        PulseFraction = PulseLength / 65.99999558
+        PulsePreDelay = PulseFraction
+        PulsePreDelay = PulsePreDelay + 0.001
+
+def Setup_Trigger():
+    global AllowTrigger
+    time.sleep(PulsePreDelay) # allow the current pulse to pass
+    AllowTrigger = True # set the allow trigger flag high
+
+def SEND_TRIGGER(threadName):
+    global Trigger_Pass,AllowTrigger,WINDOW_LENGTH,TRIGGER_DEADLINE,High,Low,mTriggerTimeEntry
+    global MesgDispOpen, MesgDispClose, WINDOW_OPEN, WINDOWS_CLOSE
+    while (exitFlag == -1):
+      if (AllowTrigger == True):
+        try:
+          GPIO.output(Trigger_Pass, High)
+          WINDOW_OPEN = True
+          MesgDispOpen = False
+          time.sleep(WINDOW_LENGTH) # open the window for an appropriate time
+          GPIO.output(Trigger_Pass, Low) # ensure the pass pulse has gone low
+          GPIO.output(Trigger_Pass, Low)
+          GPIO.output(Trigger_Pass, Low)
+          WINDOWS_CLOSE = True
+          MesgDispClose = False
+          AllowTrigger = False # reset the trigger condition
+          TRIGGER_DEADLINE = -1 # reset the trigger deadline
+          TriggerTextLabel.set("Time until Trigger: Nil") # reset the trigger label
+          mTriggerTimeEntry.configure(state=NORMAL)
+          Calibrated = False
+        except Exception,e:
+          print str(e)
+          os._exit(1)
+      time.sleep(0.0001) # operate at 10KHz
+
+def TRIGGER_MONITOR(threadName):
+    global TRIGGER_DEADLINE, PPS_COUNTER, Calibrated
+    while (exitFlag == -1):
+        try: # If the trigger deadline is met
+            if (TRIGGER_DEADLINE != -1) & (AllowTrigger == False):
+                TriggerTextLabel.set("Time until Trigger: "+str(TRIGGER_DEADLINE-PPS_COUNTER))
+                if (PPS_COUNTER == TRIGGER_DEADLINE):
+                    Setup_Trigger() # call setup trigger
+                if (PPS_COUNTER == TRIGGER_DEADLINE-2):
+                    CalculatePulseDelay()
+                if (TRIGGER_DEADLINE != -1) & (Calibrated == False): # trigger has been set immmediately calibrate
+                    CalibrateVCO()
+                    Calibrated = True
+        except Exception,e:
+            print str(e)
+            os._exit(1)
+        time.sleep(0.001)
+
+#*********** END of All Thread Related definitions ********************
+
+def StatusReturn(x): # Status dictionary
+  return {
+    '0' : "Warming Up",
+    '1' : "Tracking Set Up",
+    '2' : "Tracking PPS REF",
+    '3' : "Sync to PPS REF",
+    '4' : "Free Run",
+    '5' : "PPS REF Unstable",
+    '6' : "No PPS REF",
+    '7' : "Frozen",
+    '8' : "Factory Diagnostic",
+    '9' : "Searching RB Line...",
+    }[x]
+
+# ******************** Flag set definitions ***************************
+def ListenForSlaves():
+    global Slave_Connected
+    Slave_Connected = False
+
+def DisconnectSlaves():
+    global Disconnect
+    Disconnect = True
+    time.sleep(0.01)
+    Disconnect = False
+# ******************** End of Flag set definitions *************************
+
+def TriggerHandle(): # Function for dealing with Trigger
+    global TRIGGER_DEADLINE, PPS_COUNTER, Message, Slave_Connected, mTriggerTimeEntry
+    GLOBAL_TRIGGER = int(trig_time.get()) # now the delta
+    mTriggerTimeEntry.configure(state=DISABLED) # Disable the entry box
+    TRIGGER_DEADLINE = PPS_COUNTER + GLOBAL_TRIGGER - 1
+    #get system time
+    SysTime = str(datetime.datetime.now().time())
+    SysTimeSecond = int(SysTime[6:7])
+    Delta = TRIGGER_DEADLINE - PPS_COUNTER
+    print "Triggering Second: "+ str(SysTimeSecond + Delta)
+    if (TRIGGER_DEADLINE < PPS_COUNTER):
+        TextBox.insert(END, "DEADLINE PASSED, Pushed by 10 Seconds \n")
+        TextBox.yview(END)
+        TRIGGER_DEADLINE = TRIGGER_DEADLINE + 10
+    # Broadcast to slave
+    if (Slave_Connected == True):
+      DELTA = TRIGGER_DEADLINE - PPS_COUNTER
+      Message = "TR" + str(DELTA)
+      print str(DELTA)
+    elif (Slave_Connected == False):
+      NetworkTextBox.insert(END, "Trigger Time not Broadcast \n")
+      NetworkTextBox.yview(END)
+
+def StartPLL(): # Function for initial programming of the PLL
+    global Nil,ResetLine,Low,High
+    ResetPLL()
+    R = [None]*53 #0x34 down to 0x00
+    RegisterVals = open('PLL_Config.txt','r')
+    I =  52
+    for line in RegisterVals:
+      if (line == "Nil\n"):
+        R[I] = Nil
+      else:
+        R[I] = int(line[2:],2)
+      I = I - 1
+    # Define the instruction array
+    I1 = [Nil]*53 #MSB Instruction Array
+    I0 = [Nil]*53 #LSB Instruction Array
+    # Append the instruction array LSB with increments of all the registers
+    I0Dec = [] # Instruction array in decimal
+    for i in range(0,len(I0),1):
+      I0Dec.append(i)
+    I0 = I0Dec # The LSB is the decimal cycle
+    # Make a buffer and fill it
+    Buffer = []
+    for i in range(0,53,1): # 0 to 53
+      Buffer.append(I1[i]) # MSB goes in first
+      Buffer.append(I0[i]) #LSB goes in second
+      Buffer.append(R[i]) # Data goes in third
+    WritePLL(Buffer) # Write this buffer to the PLL
+
+def ResetPLL():
+    PLL_TextBox.insert(END, "Resetting the PLL\n")
+    GPIO.output(ResetLine,Low) #Set the Line Low
+    time.sleep(0.1)
+    GPIO.output(ResetLine,High) # Set the line highGPIO
+
+def UpdatePLL(): # Function for transferring the update bit
+    IO = []
+    IO.append(0b00000000) # MSB instruction
+    IO.append(0b00000101) # LSB instruction
+    IO.append(0b00000001) # Set bit 0 of register 5
+    PLL_TextBox.insert(END,"Updating PLL ...\n")
+    XFER = spi.xfer2(IO) #Transfer the IO update
+    PLL_TextBox.insert(END,"Complete\n")
+    PLL_TextBox.yview(END)
+
+def WritePLL(Buffer): # Function for writing a buffer to the PLL
+  global Trigger_Pass
+  GPIO.output(Trigger_Pass, Low)
+  PLL_TextBox.insert(END,"Transferring Instructions ...\n")
+  XFER = spi.xfer2(Buffer)
+  PLL_TextBox.yview(END)
+  time.sleep(0.1)
+  GPIO.output(Trigger_Pass, Low)
+
+def ProgramPLL():
+    StartPLL()
+    UpdatePLL()
+    CalibrateVCO()
+    PLL_Lock_Status()
+
+def CalibrateVCO():
+    Buffer = []
+    Buffer.append(Nil)
+    Buffer.append(0b00001110)
+    Buffer.append(0b11110100)
+    PLL_TextBox.insert(END,"Calibrating VCO ...\n")
+    WritePLL(Buffer)
+    UpdatePLL()
+
+def GPSDO_Send():
+    global GPSDO_Response
+    query = user_query.get()+"\r"
+    GPSDO.write(query)
+    GPSDO_Response = GPSDO.readline()
+    time.sleep(0.05)
+    DO_TextBox.insert(END,GPSDO_Response[:-2]+"\n")
+    DO_TextBox.yview(END)
+    # make an exception for BT
+
+def Pass_CMD(command): # pass a command to the GPSDO
+    command = command + '\r'
+    GPSDO.write(command)
+    GPSDO_Response = GPSDO.readline()
+    time.sleep(0.05)
+    DO_TextBox.insert(END,GPSDO_Response[:-2]+"\n")
+    DO_TextBox.yview(END)
+
+def Collect_Response(command):
+    command = command + '\r'
+    GPSDO.write(command)
+    time.sleep(0.05)
+    GPSDO_Response = GPSDO.readline()
+    time.sleep(0.05)
+    return GPSDO_Response
+
+def Track_Mode():
+    if Track_state.get() == 1:
+        Pass_CMD('TR1')
+    elif Track_state.get() == 0:
+        Pass_CMD('TR0')
+
+def Sync_Mode():
+    if Sync_state.get() == 1:
+        Pass_CMD('SY1')
+    elif Sync_state.get() == 0:
+        Pass_CMD('SY0')
+
+def GPS_Mode():
+    if GPS_state.get() == 1:
+        Pass_CMD('@@@@GPS')
+        DO_TextBox.insert(END,"GPS Mode Enabled")
+        DO_TextBox.yview(END)
+    elif GPS_state.get() == 0:
+        Pass_CMD('@@@@')
+        DO_TextBox.insert(END,"GPS Mode Disabled")
+        DO_TextBox.yview(END)
+
+def Setup_CheckBox():
+    if ((int(Collect_Response('TR?'))) == 1):
+        Track_state.set(1)
+    elif ((int(Collect_Response('TR?'))) == 0):
+        Track_state.set(0)
+
+    if ((int(Collect_Response('SY?'))) == 1):
+        Sync_state.set(1)
+    elif ((int(Collect_Response('SY?'))) == 0):
+        Sync_state.set(0)
+    Collect_Response('@@@@') # Switch off GPS mode
+    GPS_state.set(0)
+
+def GPSDO_Status():
+  global StatusLabel, top
+  StatusLabel = StatusReturn(str(Collect_Response('ST')[0:1]))
+  mStatusValue = Label(top,text=StatusLabel).place(x=60,y=200)
+
+def MasterCommands():
+  global top
+  global FreqAdj, PeakVoltRB, DC_Photo, Varac, RBLamp, RBHeating
+  count = 5
+  try:
+    M = Collect_Response('M')
+  except Exception,e:
+    print str(e)
+    M = " "
+  if (len(M) != 26):
+    try:
+      while (count > 0) & (len(M) != 26):
+        print "Not Responding Trying again in 2 seconds"
+        time.sleep(2)
+        M = Collect_Response('M')
+        count = count - 1
+    except Exception,e:
+      print str(e)
+
+  FreqAdjRaw = int(M[0:2],16)
+  Reserve1 = int(M[3:5],16)
+  PeakVoltRBRaw = int(M[6:8],16)
+  DC_PhotoRaw = int(M[9:11],16)
+  VaracCtrlRaw = int(M[12:14],16)
+  RBLampCurrentRaw = int(M[15:17],16)
+  RBHeatingCurrentRaw = int(M[18:20],16)
+  Reserve2 = int(M[21:23],16)
+
+  FreqAdjNorm = str(round(float(FreqAdjRaw)/51,3)) + "V"
+  PeakVoltRBNorm = str(round(float(PeakVoltRBRaw)/51,3)) + "V"
+  DC_PhotoNorm = str(round(float(DC_PhotoRaw)/51,3)) + "V"
+  VaracCtrlNorm = str(round(float(VaracCtrlRaw)/51,3)) + "V"
+  RBLampCurrentNorm = str(round(float(RBLampCurrentRaw*100)/51,3))+"mA"
+  RBHeatingCurrentNorm = str(round(float(RBHeatingCurrentRaw*100)/51,3))+"mA"
+
+  FreqAdj.set("Frequency Adjust Voltage: " + FreqAdjNorm)
+  PeakVoltRB.set("Peak RB Voltage: " + PeakVoltRBNorm)
+  DC_Photo.set("DC Photocell Voltage: " + DC_PhotoNorm)
+  Varac.set("Varactor Control Voltage: " + VaracCtrlNorm)
+  RBLamp.set("RB Lamp Current: " + RBLampCurrentNorm)
+  RBHeating.set("RB Heating Current: " + RBHeatingCurrentNorm)
+
+def Tracking_Commands():
+  global top
+  global Alarm, Tracking, Tau, CompOff, RawAdj, FreqCorr
+
+  AlarmVal = str(Collect_Response('AW???'))[0:3] +" us"
+  Alarm.set("Alarm Window: "+AlarmVal)
+  TrackingVal = str(Collect_Response('TW???'))[0:3] +" us"
+  Tracking.set("Tracking Window: " + TrackingVal)
+  TauVal = str(Collect_Response('TC??????'))[0:6] +" s"
+  Tau.set("Time Constant: " + TauVal)
+  CompOffVal = str(Collect_Response('CO????'))[0:4] +" ns"
+  CompOff.set("Comparator Offset: " + CompOffVal)
+  RawAdjVal = str(float(str(Collect_Response('RA????')[0:3])) * 66)+" ns"
+  RawAdj.set("Raw Phase Adjust: " + RawAdjVal)
+  RawResponse = str(Collect_Response('FC??????'))
+  FreqCorrRaw = str(RawResponse[1:6])
+  FreqSign = str(RawResponse[0])
+  FreqNorm = round(float(FreqCorrRaw)*(0.00512),5)
+  if (FreqSign == "+"):
+    FreqCorr.set("Frequency in use: " + "+" + str(FreqNorm) + " mHz")
+  elif (FreqSign == "-"):
+    FreqCorr.set("Frequency in use: " + "-" + str(FreqNorm) + " mHz")
+
+def LaunchTerminal():
+  global top, status, SyncPeriod
+  global FreqAdj, PeakVoltRB, DC_Photo, Varac, RBLamp, RBHeating
+  global Alarm, Tracking, Tau, CompOff, RawAdj, FreqCorr
+  global DisableTimeMonitor
+  DisableTimeMonitor = True
+  status = StringVar()
+  top = Toplevel()
+  top.geometry("600x300+200+200")
+  top.title("GPSDO Parameters")
+  mLabel = Label(top,text="Probe Values:").place(x=10,y=10)
+  mProbeHeart = Button(top,text="Refresh Values",command=RefreshValues).place(x=100,y=10)
+
+  #Obtain ID's and display
+  mID= Label(top,text="ID: ").place(x=340,y=10)
+  ID = str(Collect_Response('ID'))
+  mIDRes = Label(top,text=ID).place(x=360,y=10)
+  GPSDO_Status()
+  mStatus = Label(top,text="Status: ").place(x=10,y=200)
+
+  # create the master command labels
+  mFreqAdjLabel = Label(top,textvariable=FreqAdj).place(x=10,y=50)
+  mPeakVoltRBLabel = Label(top,textvariable=PeakVoltRB).place(x=10,y=70)
+  mDC_PhotoLabel = Label(top,textvariable=DC_Photo).place(x=10,y=90)
+  mVaracLabel = Label(top,textvariable=Varac).place(x=10,y=110)
+  mRBLampLabel = Label(top,textvariable=RBLamp).place(x=10,y=130)
+  mRBHeatingLabel = Label(top,textvariable=RBHeating).place(x=10,y=150)
+  MasterCommands()
+
+  #create the tracking commmand labels
+  mAlarmLabel = Label(top,textvariable=Alarm).place(x=340,y=50)
+  mTrackingLabel = Label(top,textvariable=Tracking).place(x=340,y=70)
+  mTauLabel = Label(top,textvariable=Tau).place(x=340,y=90)
+  mCompOffLabel = Label(top,textvariable=CompOff).place(x=340,y=110)
+  mRawAdjLabel = Label(top,textvariable=RawAdj).place(x=340,y=130)
+  mFreqCorrLabel = Label(top,textvariable=FreqCorr).place(x=340,y=150)
+  Tracking_Commands()
+
+  #Sync periodicity
+  mSyncLabel = Label(top,text="Enter Sync Period: ").place(x=10,y=220)
+  mSyncPeriod = Entry(top,textvariable=SyncPeriod).place(x=10,y=240)
+  mSyncConfirm = Button(top,text="Confirm",command=SyncPeriodUpdate).place(x=120,y=240)
+
+  #Launch GPS Mode
+  mGPSButton = Button(top,text="View GPS Signals",command=ViewGPS).place(x=400,y=240)
+
+  Exit = Button(top, text="Exit",command=TopExit).place(x=530,y=240)
+
+def SyncPeriodUpdate():
+    SyncPeriod.set(SyncPeriod.get())
+
+def RefreshValues():
+  Tracking_Commands()
+  GPSDO_Status()
+  MasterCommands()
+
+def TopExit():
+    global DisableTimeMonitor
+    top.destroy()
+    DisableTimeMonitor = False
+
+# ******************** GPS related defintions********************
+
+def ExitGPS():
+    global gps_top, GPS_Readings
+    print "GPS Mode Disabled"
+    GPS_Readings = False
+    time.sleep(0.1)
+    Collect_Response('@@@@') # Disable GPS mode
+    gps_top.destroy()
+
+def ViewGPS(): # inititates the GPS top level interface
+  global gps_top, status, GPS_Readings
+  global Latitude,Longitude,TimeUTC,Altitude,EPS,EPX,EPV,EPT,Speed,Climb,Track,Mode,Sat
+
+  gps_top = Toplevel()
+  gps_top.geometry("500x200+150+150")
+  gps_top.title("GPS Mode")
+  #DisableTimeMonitor = True
+  Collect_Response('@@@@GPS') # Enable gps mode
+  print "GPS mode enabled"
+  time.sleep(1)
+  print "Setting GPS readings to true"
+  GPS_Readings = True
+
+  #Initiate the labels
+  mLat = Label(gps_top,textvariable=Latitude).place(x=10,y=10)
+  mLong = Label(gps_top,textvariable=Longitude).place(x=10,y=30)
+  mTimeUTC = Label(gps_top,textvariable=TimeUTC).place(x=10,y=50)
+  mAlt = Label(gps_top,textvariable=Altitude).place(x=10,y=70)
+  mEPS = Label(gps_top,textvariable=EPS).place(x=10,y=90)
+  mEPX = Label(gps_top,textvariable=EPX).place(x=10,y=110)
+  mEPV = Label(gps_top,textvariable=EPV).place(x=10,y=130)
+  mEPT = Label(gps_top,textvariable=EPT).place(x=250,y=10)
+  mSpeed = Label(gps_top,textvariable=Speed).place(x=250,y=30)
+  mClimb = Label(gps_top,textvariable=Climb).place(x=250,y=110)
+  mTrack = Label(gps_top,textvariable=Track).place(x=250,y=70)
+  mMode = Label(gps_top,textvariable=Mode).place(x=250,y=90)
+  mSat = Label(gps_top,textvariable=Sat).place(x=10,y=150)
+
+  gpsExit = Button(gps_top,text="Exit",command=ExitGPS).place(x=450,y=160)
+
+# *********************** Program Begin ********************************
+
+#Create an interrupt routine for PPS OUT
+GPIO.add_event_detect(PPS_OUT, GPIO.RISING, callback= PPS_Interrupt_Call)
+GPIO.add_event_detect(PPS_OUT2, GPIO.RISING, callback= PPS_Interrupt_Call)
+GPIO.add_event_detect(PPS_OUT3, GPIO.RISING, callback= PPS_Interrupt_Call)
+
+# Program Setup
+if (GPSDO_Present == True):
+    print "GPSDO Control Started"
+    c = 3
+    while (c > 0):
+     a = GPSDO.readline()
+     c = c - 1
+    time.sleep(0.025)
+    if (Collect_Response('SN') == ''):
+        time.sleep(0.01)
+        print "GPSDO not detected"
+    else:
+        time.sleep(0.1)
+        Collect_Response('@@@@') #Ensure GPS Mode is disabled
+        time.sleep(0.1)
+        Setup_CheckBox()
+    SyncPeriod.set("20")
+    print "Default Sync Period: " + str(SyncPeriod.get()) + "Seconds"
+# End of program setup
+
+# PLL Items
+mlabel = Label(mGui,text="PLL Controls").place(x=400,y=0)
+mbutton = Button(mGui,text="Program PLL",command = ProgramPLL).place(x=400,y=20)
+mbutton = Button(mGui,text="Reset PLL",command = ResetPLL).place(x=510,y=20)
+mbutton = Button(mGui,text="VCO Calibration",command = CalibrateVCO).place(x=610,y=20)
+mlabel = Label(mGui,text="PLL Information").place(x=400,y=90)
+PLL_TextBox = Text(mGui,height=8,width=45)
+PLL_TextBox.place(x=400,y=110)
+PLL_Scroll = Scrollbar(PLL_TextBox,command=PLL_TextBox.yview)
+PLL_TextBox.configure(yscrollcommand=PLL_Scroll.set)
+mLockLabel = Label(mGui,textvariable=PLLtextString).place(x=400,y=60)
+# End of PLL Items
+
+# GPSDO Items
+mlabel = Label(mGui,text="GPSDO Controls").grid(row=1,column=0)
+mlabel = Label(mGui,text="Enter Query").grid(row=2,column=0)
+mEntry = Entry(mGui,textvariable=user_query).grid(row=2,column=1)
+mbutton = Button(mGui,text="Send",command=GPSDO_Send).grid(row=2,column=2)
+mlabel = Label(mGui,text="Track: ").grid(row=4,column=0)
+mlabel = Label(mGui,text="Sync: ").grid(row=4,column=1)
+mlabel = Label(mGui,text="GPS: ").grid(row=4,column=2)
+mCheck_TR = Checkbutton(mGui,state=ACTIVE,variable=Track_state,onvalue=1,offvalue=0,command=Track_Mode)
+mCheck_SY = Checkbutton(mGui,state=ACTIVE,variable=Sync_state,onvalue=1,offvalue=0,command=Sync_Mode)
+mCheck_GPS =Checkbutton(mGui,state=ACTIVE,variable=GPS_state,onvalue=1,offvalue=0,command=GPS_Mode)
+mCheck_TR.grid(row=5,column=0)
+mCheck_SY.grid(row=5,column=1)
+mCheck_GPS.grid(row=5,column=2)
+mlabel = Label(mGui,text="GPSDO Response").place(x=0,y=90)
+DO_TextBox = Text(mGui,height=8,width=45)
+DO_TextBox.place(x=0,y=110)
+DO_Scroll = Scrollbar(DO_TextBox,command=DO_TextBox.yview)
+DO_TextBox.configure(yscrollcommand=DO_Scroll.set)
+GPSDO_Terminal = Button(mGui,text="GPSDO Parameters",command=LaunchTerminal)
+GPSDO_Terminal.place(x=200,y=85)
+try:
+    Pass_CMD('ID') #Obtain and print the ID of the GPSDO
+    DO_TextBox.insert(END,"GPSDO Communications Initiated\n")
+    DO_TextBox.insert(END,"Default Sync Interval: " + str(SyncPeriod.get()) + "\n")
+    DO_TextBox.yview(END)
+except Exception,e:
+    print str(e)
+    DO_TextBox.insert(END,"GPSDO Communications Failed\n")
+# End of GPSDO Items
+
+# Trigger Controls
+mlabel = Label(mGui,text="Trigger Controls").place(x=0,y=240)
+TextBox = Text(mGui, height=8, width=45)
+TextBox.place(x=0,y=260)
+scroll = Scrollbar(TextBox,command=TextBox.yview)
+TextBox.configure(yscrollcommand=scroll.set)
+mTrigLabel = Label(mGui,text="Enter seconds in future to Trigger").place(x=0,y=380)
+mTriggerTimeEntry = Entry(mGui,textvariable=trig_time)
+mTriggerTimeEntry.place(x=0,y=400)
+mTrigConfirm = Button(mGui,text="Confirm",command=TriggerHandle).place(x=180,y=400)
+TriggerTextLabel.set("Seconds until Trigger: Nil")
+mTrigLabel = Label(mGui,textvariable=TriggerTextLabel).place(x=0,y=420)
+# End of Trigger controls
+
+#Network management
+NetworkMainLabel = Label(mGui,text="Network Information").place(x=400,y=240)
+NetworkTextBox = Text(mGui, height=8, width=45)
+NetworkTextBox.place(x=400,y=260)
+NetworkScroll = Scrollbar(TextBox,command=TextBox.yview)
+NetworkTextBox.configure(yscrollcommand=scroll.set)
+mButtonListen = Button(mGui,text="Listen",command=ListenForSlaves).place(x=400,y=420)
+mButtonDisconnect = Button(mGui,text="Disconnect",command=DisconnectSlaves).place(x=500,y=420)
+#End of Network management
+
+# Timing Initiation
+mTimeLabel = Label(mGui,textvariable=current_time).place(x=400,y=380)
+# End of timing initiation
+
+#Start All threads
+PLL_LOCK_THREAD = myThread(1, "PLL LOCK THREAD")
+PLL_LOCK_THREAD.start()
+TRIGGER_THREAD = myThread(2, "TRIGGER THREAD")
+TRIGGER_THREAD.start()
+PPS_DETECT_THREAD = myThread(3, "PPS DETECT THREAD")
+PPS_DETECT_THREAD.start()
+TRIGGER_MONITOR_THREAD = myThread(4, "TRIGGER MONITOR THREAD")
+TRIGGER_MONITOR_THREAD.start()
+SEND_DATA_SLAVE_THREAD = myThread(5, "SEND DATA SLAVE THREAD")
+SEND_DATA_SLAVE_THREAD.start()
+RECEIVE_DATA_SLAVE_THREAD = myThread(6, "RECEIVE DATA SLAVE THREAD")
+RECEIVE_DATA_SLAVE_THREAD.start()
+LISTEN_FOR_SLAVE_THREAD = myThread(7, "LISTEN FOR SLAVE THREAD")
+LISTEN_FOR_SLAVE_THREAD.start()
+DISCONNECT_THREAD = myThread(8, "DISCONNECT THREAD")
+DISCONNECT_THREAD.start()
+TIME_MONITOR_THREAD = myThread(9, "TIME MONITOR THREAD")
+TIME_MONITOR_THREAD.start()
+GPS_POLLER_THREAD = myThread(10, "GPS POLLER THREAD")
+GPS_POLLER_THREAD.start()
+PPS_TICKER_THREAD = myThread(11, "PPS TICKER THREAD")
+PPS_TICKER_THREAD.start()
+SYNC_PERIOD_THREAD = myThread(12, "SYNC PERIOD THREAD")
+SYNC_PERIOD_THREAD.start()
+#End of thread management
+
+#Prepatory Initiations
+#print "\n Programming PLL \n"
+#ProgramPLL()
+#End of prepatory initiations
+
+# Misc buttons
+mExit = Button(mGui,text="Exit",command=exit_routine).place(x=660,y=420)
+# End of Misc Buttons
+
+mGui.mainloop() #End of program
+
+# *********************** Program End ********************************
